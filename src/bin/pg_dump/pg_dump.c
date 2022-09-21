@@ -390,61 +390,8 @@ static char *nextToken(register char **stringp, register const char *delim);
 static void addDistributedBy(Archive *fout, PQExpBuffer q, const TableInfo *tbinfo, int actual_atts);
 static void addDistributedByOld(Archive *fout, PQExpBuffer q, const TableInfo *tbinfo, int actual_atts);
 static void addSchedule(Archive *fout, PQExpBuffer q, const TableInfo *tbinfo);
-static bool isMPP(Archive *fout);
-static bool isGPDB5000OrLater(Archive *fout);
-static bool isGPDB6000OrLater(Archive *fout);
 
 /* END MPP ADDITION */
-
-/*
- * Check if we are talking to Greenplum or Cloudberry
- */
-static bool
-isMPP(Archive *fout)
-{
-	static int	value = -1;		/* -1 = not known yet, 0 = no, 1 = yes */
-
-	/* Query the server on first call, and cache the result */
-	if (value == -1)
-	{
-		const char *query = "select pg_catalog.version()";
-		PGresult   *res;
-		char	   *ver;
-
-		res = ExecuteSqlQuery(fout, query, PGRES_TUPLES_OK);
-
-		ver = (PQgetvalue(res, 0, 0));
-		if (strstr(ver, "Cloudberry") != NULL || strstr(ver, "Greenplum") != NULL)
-			value = 1;
-		else
-			value = 0;
-
-		PQclear(res);
-	}
-	return (value == 1) ? true : false;
-}
-
-
-static bool
-isGPDB5000OrLater(Archive *fout)
-{
-	if (!isMPP(fout))
-		return false;		/* Not GP-based at all. */
-
-	/* GPDB 5 is based on PostgreSQL 8.3 */
-	return fout->remoteVersion >= 80300;
-}
-
-
-static bool
-isGPDB6000OrLater(Archive *fout)
-{
-	if (!isMPP(fout))
-		return false;		/* Not GP-based at all. */
-
-	/* GPDB 6 is based on PostgreSQL 9.4 */
-	return fout->remoteVersion >= 90400;
-}
 
 int
 main(int argc, char **argv)
@@ -939,7 +886,7 @@ main(int argc, char **argv)
 	 * We allow the server to be back to 8.3, and up to any minor release of
 	 * our own major version.  (See also version check in pg_dumpall.c.)
 	 */
-	fout->minRemoteVersion = 80300;	/* we can handle back to 8.3 */
+	fout->minRemoteVersion = GPDB5_MAJOR_PGVERSION;	/* we can handle back to 8.3 */
 	fout->maxRemoteVersion = (PG_VERSION_NUM / 100) * 100 + 99;
 
 	fout->numWorkers = numWorkers;
@@ -3794,9 +3741,9 @@ dumpDatabaseConfig(Archive *AH, PQExpBuffer outbuf,
 	}
 
 	/*
-	 * If we're upgrading from GPDB 5 or below, use the legacy hash ops.
+	 * If we're upgrading from GPDB 5, use the legacy hash ops.
 	 */
-	if (AH->dopt->binary_upgrade && AH->remoteVersion < 90400)
+	if (AH->dopt->binary_upgrade && AH->remoteVersion < GPDB6_MAJOR_PGVERSION)
 	{
 		makeAlterConfigCommand(conn, "gp_use_legacy_hashops=on",
 							   "DATABASE", dbname, NULL, NULL, outbuf);
@@ -7248,7 +7195,7 @@ getTables(Archive *fout, int *numTables)
 					" AND tc.relkind = " CppAsString2(RELKIND_TOASTVALUE)
 					" AND c.relkind <> " CppAsString2(RELKIND_PARTITIONED_TABLE) ")\n");
 
-	if (fout->remoteVersion <= 90426) // GPDB 6 or below
+	if (fout->remoteVersion < GPDB7_MAJOR_PGVERSION)
 		appendPQExpBufferStr(query,
 						  "LEFT JOIN pg_partition_rule pr ON c.oid = pr.parchildrelid\n"
 						  "LEFT JOIN pg_partition p ON pr.paroid = p.oid\n"
@@ -13079,7 +13026,6 @@ dumpFunc(Archive *fout, const FuncInfo *finfo)
 	char	  **allargtypes = NULL;
 	char	  **argmodes = NULL;
 	char	  **argnames = NULL;
-	bool		isGE50 = isGPDB5000OrLater(fout);
 	char	  **configitems = NULL;
 	int			nconfigitems = 0;
 	const char *keyword;
@@ -13140,7 +13086,7 @@ dumpFunc(Archive *fout, const FuncInfo *finfo)
 								"false AS proleakproof,\n");
 
 		/* GPDB6 added proexeclocation */
-		if (fout->remoteVersion >= 90400)
+		if (fout->remoteVersion >= GPDB6_MAJOR_PGVERSION)
 				appendPQExpBuffer(query,
 								"proexeclocation,\n");
 		else
@@ -13212,12 +13158,8 @@ dumpFunc(Archive *fout, const FuncInfo *finfo)
 		probin = NULL;
 		prosqlbody = PQgetvalue(res, 0, PQfnumber(res, "prosqlbody"));
 	}
-	/*
-	* GPDB_14_MERGE_FIXME:
-	* isGE50 is >= 80300 but upstream is (fout->remoteVersion >= 80400)
-	* Need to check.
-	*/
-	if (isGE50)
+
+	if (fout->remoteVersion >= GPDB5_MAJOR_PGVERSION)
 	{
 		funcargs = PQgetvalue(res, 0, PQfnumber(res, "funcargs"));
 		funciargs = PQgetvalue(res, 0, PQfnumber(res, "funciargs"));
@@ -17023,7 +16965,6 @@ dumpExternal(Archive *fout, const TableInfo *tbinfo, PQExpBuffer q, PQExpBuffer 
 		bool		isweb = false;
 		bool		iswritable = false;
 		char	   *options;
-		bool		gpdb6OrLater = isGPDB6000OrLater(fout);
 		char	   *logerrors = NULL;
 		char	   *on_clause;
 		char	   *qualrelname;
@@ -17039,7 +16980,7 @@ dumpExternal(Archive *fout, const TableInfo *tbinfo, PQExpBuffer q, PQExpBuffer 
 						  qualrelname);
 
 		/* Now get required information from pg_exttable */
-		if (gpdb6OrLater)
+		if (fout->remoteVersion >= GPDB6_MAJOR_PGVERSION)
 		{
 			appendPQExpBuffer(query,
 					"SELECT x.urilocation, x.execlocation, x.fmttype, x.fmtopts, x.command, "
@@ -17890,7 +17831,7 @@ dumpTableSchema(Archive *fout, const TableInfo *tbinfo)
 		 * These do not exist on GPDB7, so first check if we are dumping
 		 * from <= GPDB6.
 		 */
-		if (fout->remoteVersion <= 90400 &&
+		if (fout->remoteVersion < GPDB7_MAJOR_PGVERSION &&
 				(*tbinfo->partclause && *tbinfo->partclause != '\0'))
 		{
 			/* partition by clause */
@@ -18071,7 +18012,7 @@ dumpTableSchema(Archive *fout, const TableInfo *tbinfo)
 					appendStringLiteralAH(q, tbinfo->attnames[j], fout);
 
 					/* GPDB partitioning */
-					if (fout->remoteVersion <= 90400)
+					if (fout->remoteVersion < GPDB7_MAJOR_PGVERSION)
 					{
 						/*
 						 * Do for all descendants of a partition table.
@@ -20737,7 +20678,7 @@ addSchedule(Archive *fout, PQExpBuffer q, const TableInfo *tbinfo)
 static void
 addDistributedBy(Archive *fout, PQExpBuffer q, const TableInfo *tbinfo, int actual_atts)
 {
-	if (isGPDB6000OrLater(fout))
+	if (fout->remoteVersion >= GPDB6_MAJOR_PGVERSION)
 	{
 		PQExpBuffer query = createPQExpBuffer();
 		PGresult   *res;
